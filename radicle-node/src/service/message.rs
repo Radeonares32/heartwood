@@ -1,5 +1,6 @@
 use std::{fmt, io, mem};
 
+use nonempty::NonEmpty;
 use radicle::git;
 use radicle::storage::refs::RefsAt;
 
@@ -167,14 +168,14 @@ pub struct RefsAnnouncement {
 #[derive(Default)]
 pub struct RefsStatus {
     /// The `rad/sigrefs` was missing or it's ahead of the local
-    /// `rad/sigrefs`.
-    pub fresh: Vec<RefsAt>,
-    /// The `rad/sigrefs` has been seen before.
-    pub stale: Vec<RefsAt>,
+    /// `rad/sigrefs`. We want it.
+    pub want: Vec<RefsAt>,
+    /// The `rad/sigrefs` has been seen before. We already have it.
+    pub have: Vec<RefsAt>,
 }
 
 impl RefsStatus {
-    /// Get the set of `fresh` and `stale` `RefsAt`'s for the given
+    /// Get the set of `want` and `have` `RefsAt`'s for the given
     /// announcement.
     ///
     /// Nb. We use the refs database as a cache for quick lookups. This does *not* check
@@ -183,7 +184,7 @@ impl RefsStatus {
     /// and old refs announcements will be discarded due to their lower timestamps.
     pub fn new<D: node::refs::Store>(
         rid: RepoId,
-        refs: Vec<RefsAt>,
+        refs: NonEmpty<RefsAt>,
         db: &D,
     ) -> Result<RefsStatus, storage::Error> {
         let mut status = RefsStatus::default();
@@ -202,13 +203,13 @@ impl RefsStatus {
         match db.get(repo, &theirs.remote, &storage::refs::SIGREFS_BRANCH) {
             Ok(Some((ours, _))) => {
                 if theirs.at != ours {
-                    self.fresh.push(theirs);
+                    self.want.push(theirs);
                 } else {
-                    self.stale.push(theirs);
+                    self.have.push(theirs);
                 }
             }
             Ok(None) => {
-                self.fresh.push(theirs);
+                self.want.push(theirs);
             }
             Err(e) => {
                 log::warn!(
@@ -460,17 +461,17 @@ impl Message {
         };
         let msg = match self {
             Self::Announcement(Announcement { node, message, .. }) => match message {
-                AnnouncementMessage::Node(NodeAnnouncement { addresses, .. }) => format!(
-                    "{verb} node announcement of {node} with {} address(es) {prep} {remote}",
+                AnnouncementMessage::Node(NodeAnnouncement { addresses, timestamp, .. }) => format!(
+                    "{verb} node announcement of {node} with {} address(es) {prep} {remote} (t={timestamp})",
                     addresses.len()
                 ),
-                AnnouncementMessage::Refs(RefsAnnouncement { rid, refs, .. }) => format!(
-                    "{verb} refs announcement of {node} for {rid} with {} remote(s) {prep} {remote}",
+                AnnouncementMessage::Refs(RefsAnnouncement { rid, refs, timestamp }) => format!(
+                    "{verb} refs announcement of {node} for {rid} with {} remote(s) {prep} {remote} (t={timestamp})",
                     refs.len()
                 ),
-                AnnouncementMessage::Inventory(InventoryAnnouncement { inventory, .. }) => {
+                AnnouncementMessage::Inventory(InventoryAnnouncement { inventory, timestamp }) => {
                     format!(
-                        "{verb} inventory announcement of {node} with {} item(s) {prep} {remote}",
+                        "{verb} inventory announcement of {node} with {} item(s) {prep} {remote} (t={timestamp})",
                         inventory.len()
                     )
                 }
@@ -600,7 +601,7 @@ mod tests {
         let msg: Message = AnnouncementMessage::from(RefsAnnouncement {
             rid: arbitrary::gen(1),
             refs,
-            timestamp: LocalTime::now().as_millis(),
+            timestamp: LocalTime::now().into(),
         })
         .signed(&MockSigner::default())
         .into();
@@ -620,7 +621,7 @@ mod tests {
                 inventory: arbitrary::vec(INVENTORY_LIMIT)
                     .try_into()
                     .expect("size within bounds limit"),
-                timestamp: LocalTime::now().as_millis(),
+                timestamp: LocalTime::now().into(),
             },
             &MockSigner::default(),
         );
@@ -645,7 +646,7 @@ mod tests {
     #[quickcheck]
     fn prop_refs_announcement_signing(rid: RepoId) {
         let signer = MockSigner::new(&mut fastrand::Rng::new());
-        let timestamp = 0;
+        let timestamp = Timestamp::EPOCH;
         let at = raw::Oid::zero().into();
         let refs = BoundedVec::collect_from(
             &mut [RefsAt {
@@ -668,7 +669,7 @@ mod tests {
     fn test_node_announcement_validate() {
         let ann = NodeAnnouncement {
             features: node::Features::SEED,
-            timestamp: 42491841,
+            timestamp: Timestamp::from(42491841),
             alias: Alias::new("alice"),
             addresses: BoundedVec::new(),
             nonce: 0,

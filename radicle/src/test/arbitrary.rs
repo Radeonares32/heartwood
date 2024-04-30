@@ -6,6 +6,8 @@ use std::{iter, net};
 
 use crypto::test::signer::MockSigner;
 use crypto::{PublicKey, Unverified, Verified};
+use cyphernet::addr::tor::OnionAddrV3;
+use cyphernet::EcPk;
 use nonempty::NonEmpty;
 use qcheck::Arbitrary;
 
@@ -17,7 +19,7 @@ use crate::identity::{
     Did,
 };
 use crate::node::address::AddressType;
-use crate::node::{Address, Alias};
+use crate::node::{Address, Alias, Timestamp};
 use crate::storage;
 use crate::storage::refs::{Refs, RefsAt, SignedRefs};
 use crate::test::storage::{MockRepository, MockStorage};
@@ -260,7 +262,7 @@ impl Arbitrary for RepoId {
 
 impl Arbitrary for AddressType {
     fn arbitrary(g: &mut qcheck::Gen) -> Self {
-        let t = *g.choose(&[1, 2, 3]).unwrap() as u8;
+        let t = *g.choose(&[1, 2, 3, 4]).unwrap() as u8;
 
         AddressType::try_from(t).unwrap()
     }
@@ -285,7 +287,13 @@ impl Arbitrary for Address {
                 .unwrap()
                 .to_string(),
             ),
-            AddressType::Onion => todo!(),
+            AddressType::Onion => {
+                let pk = PublicKey::arbitrary(g);
+                let addr = OnionAddrV3::from(
+                    cyphernet::ed25519::PublicKey::from_pk_compressed(**pk).unwrap(),
+                );
+                cyphernet::addr::HostName::Tor(addr)
+            }
         };
 
         Address::from(cyphernet::addr::NetAddr {
@@ -302,5 +310,11 @@ impl Arbitrary for Alias {
             .unwrap();
 
         Alias::from_str(s).unwrap()
+    }
+}
+
+impl Arbitrary for Timestamp {
+    fn arbitrary(g: &mut qcheck::Gen) -> Self {
+        Self::from(u64::arbitrary(g))
     }
 }

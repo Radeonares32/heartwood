@@ -60,7 +60,7 @@ use crate::{git, identity, rad, runtime, service, test};
 #[test]
 fn test_inventory_decode() {
     let inventory: Vec<RepoId> = arbitrary::gen(300);
-    let timestamp = LocalTime::now().as_millis();
+    let timestamp: Timestamp = LocalTime::now().into();
 
     let mut buf = Vec::new();
     inventory.as_slice().encode(&mut buf).unwrap();
@@ -260,7 +260,7 @@ fn test_inventory_sync() {
     let bob_signer = MockSigner::default();
     let bob_storage = fixtures::storage(tmp.path().join("bob"), &bob_signer).unwrap();
     let bob = Peer::config("bob", [8, 8, 8, 8], bob_storage, peer::Config::default());
-    let now = LocalTime::now().as_millis();
+    let now = LocalTime::now().into();
     let projs = bob.storage().inventory().unwrap();
 
     alice.connect_to(&bob);
@@ -374,7 +374,7 @@ fn test_inventory_pruning() {
                         inventory: test::arbitrary::vec::<RepoId>(num_projs)
                             .try_into()
                             .unwrap(),
-                        timestamp: bob.local_time().as_millis(),
+                        timestamp: bob.local_time().into(),
                     },
                     peer.signer(),
                 ),
@@ -567,8 +567,8 @@ fn test_announcement_rebroadcast_timestamp_filtered() {
         eve.id(),
         Message::Subscribe(Subscribe {
             filter: Filter::default(),
-            since: alice.local_time().as_millis(),
-            until: (alice.local_time() + delta).as_millis(),
+            since: alice.local_time().into(),
+            until: (alice.local_time() + delta).into(),
         }),
     );
 
@@ -946,7 +946,7 @@ fn test_inventory_relay() {
     let bob = Peer::new("bob", [8, 8, 8, 8]);
     let eve = Peer::new("eve", [9, 9, 9, 9]);
     let inv = BoundedVec::try_from(arbitrary::vec(1)).unwrap();
-    let now = LocalTime::now().as_millis();
+    let now = LocalTime::now().into();
 
     // Inventory from Bob relayed to Eve.
     alice.init();
@@ -1274,7 +1274,7 @@ fn test_seed_repo_subscribe() {
             filter,
             since,
             ..
-        })) if since == alice.clock().as_millis() && filter.contains(&rid)
+        })) if since == alice.timestamp() && filter.contains(&rid)
     );
 }
 
@@ -1292,7 +1292,7 @@ fn test_fetch_missing_inventory_on_gossip() {
         Message::inventory(
             InventoryAnnouncement {
                 inventory: vec![rid].try_into().unwrap(),
-                timestamp: now.as_millis(),
+                timestamp: now.into(),
             },
             bob.signer(),
         ),
@@ -1317,7 +1317,7 @@ fn test_fetch_missing_inventory_on_schedule() {
         Message::inventory(
             InventoryAnnouncement {
                 inventory: vec![rid].try_into().unwrap(),
-                timestamp: now.as_millis(),
+                timestamp: now.into(),
             },
             bob.signer(),
         ),
@@ -1365,7 +1365,7 @@ fn test_queued_fetch_max_capacity() {
     alice.command(Command::Fetch(rid3, bob.id, DEFAULT_TIMEOUT, send3));
 
     // The first fetch is initiated.
-    assert_matches!(alice.fetches().next(), Some((rid, _, _)) if rid == rid1);
+    assert_matches!(alice.fetches().next(), Some((rid, _)) if rid == rid1);
     // We shouldn't send out the 2nd, 3rd fetch while we're doing the 1st fetch.
     assert_matches!(alice.outbox().next(), None);
 
@@ -1375,14 +1375,14 @@ fn test_queued_fetch_max_capacity() {
     // Finish the 1st fetch.
     alice.fetched(rid1, bob.id, Ok(fetch::FetchResult::new(doc.clone())));
     // Now the 1st fetch is done, the 2nd fetch is dequeued.
-    assert_matches!(alice.fetches().next(), Some((rid, _, _)) if rid == rid2);
+    assert_matches!(alice.fetches().next(), Some((rid, _)) if rid == rid2);
     // ... but not the third.
     assert_matches!(alice.fetches().next(), None);
 
     // Finish the 2nd fetch.
     alice.fetched(rid2, bob.id, Ok(fetch::FetchResult::new(doc)));
     // Now the 2nd fetch is done, the 3rd fetch is dequeued.
-    assert_matches!(alice.fetches().next(), Some((rid, _, _)) if rid == rid3);
+    assert_matches!(alice.fetches().next(), Some((rid, _)) if rid == rid3);
 }
 
 #[test]
@@ -1421,7 +1421,7 @@ fn test_queued_fetch_from_ann_same_rid() {
     alice.receive(carol.id, carol.announcement(ann));
 
     // The first fetch is initiated.
-    assert_matches!(alice.fetches().next(), Some((rid_, nid_, _)) if rid_ == rid && nid_ == bob.id);
+    assert_matches!(alice.fetches().next(), Some((rid_, nid_)) if rid_ == rid && nid_ == bob.id);
     // We shouldn't send out the 2nd, 3rd fetch while we're doing the 1st fetch.
     assert_matches!(alice.fetches().next(), None);
 
@@ -1490,7 +1490,7 @@ fn test_queued_fetch_from_command_same_rid() {
     alice.command(Command::Fetch(rid1, carol.id, DEFAULT_TIMEOUT, send3));
 
     // The first fetch is initiated.
-    assert_matches!(alice.fetches().next(), Some((rid, nid, _)) if rid == rid1 && nid == bob.id);
+    assert_matches!(alice.fetches().next(), Some((rid, nid)) if rid == rid1 && nid == bob.id);
     // We shouldn't send out the 2nd, 3rd fetch while we're doing the 1st fetch.
     assert_matches!(alice.outbox().next(), None);
 
@@ -1500,14 +1500,14 @@ fn test_queued_fetch_from_command_same_rid() {
     // Finish the 1st fetch.
     alice.fetched(rid1, bob.id, Ok(arbitrary::gen::<fetch::FetchResult>(1)));
     // Now the 1st fetch is done, the 2nd fetch is dequeued.
-    assert_matches!(alice.fetches().next(), Some((rid, nid, _)) if rid == rid1 && nid == eve.id);
+    assert_matches!(alice.fetches().next(), Some((rid, nid)) if rid == rid1 && nid == eve.id);
     // ... but not the third.
     assert_matches!(alice.fetches().next(), None);
 
     // Finish the 2nd fetch.
     alice.fetched(rid1, eve.id, Ok(arbitrary::gen::<fetch::FetchResult>(1)));
     // Now the 2nd fetch is done, the 3rd fetch is dequeued.
-    assert_matches!(alice.fetches().next(), Some((rid, nid, _)) if rid == rid1 && nid == carol.id);
+    assert_matches!(alice.fetches().next(), Some((rid, nid)) if rid == rid1 && nid == carol.id);
 }
 
 #[test]

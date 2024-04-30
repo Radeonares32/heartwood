@@ -5,7 +5,7 @@ Bob tries to fetch it, and even though he's connected to Alice, it fails.
 $ rad ls
 ```
 ``` ~bob (fail)
-$ rad clone rad:z2ug5mwNKZB8KGpBDRTrWHAMbvHCu --seed z6MknSLrJoTcukLrE435hVNQT4JUhbvWLX4kUzqkEStBU8Vi --timeout 1
+$ rad clone rad:z2ug5mwNKZB8KGpBDRTrWHAMbvHCu --private --seed z6MknSLrJoTcukLrE435hVNQT4JUhbvWLX4kUzqkEStBU8Vi --timeout 1
 ✓ Seeding policy updated for rad:z2ug5mwNKZB8KGpBDRTrWHAMbvHCu with scope 'all'
 ✗ Fetching rad:z2ug5mwNKZB8KGpBDRTrWHAMbvHCu from z6MknSL…StBU8Vi.. error: failed to perform fetch handshake
 ✗ Error: repository rad:z2ug5mwNKZB8KGpBDRTrWHAMbvHCu not found
@@ -21,7 +21,8 @@ $ rad sync --announce --timeout 3
 ✓ Synced with 1 node(s)
 ```
 
-Bob can now fetch the private repo:
+Bob can now fetch the private repo without specifying a seed, because he knows
+that Alice has the repo after she announced her refs:
 
 ``` ~bob
 $ rad sync rad:z2ug5mwNKZB8KGpBDRTrWHAMbvHCu --fetch

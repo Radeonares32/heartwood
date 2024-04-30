@@ -11,6 +11,7 @@ pub mod policy;
 pub mod refs;
 pub mod routing;
 pub mod seed;
+pub mod timestamp;
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader};
@@ -41,6 +42,7 @@ pub use db::Database;
 pub use events::{Event, Events};
 pub use features::Features;
 pub use seed::SyncedAt;
+pub use timestamp::Timestamp;
 
 /// Default name for control socket file.
 pub const DEFAULT_SOCKET_NAME: &str = "control.sock";
@@ -64,9 +66,6 @@ pub const NODE_ANNOUNCEMENT_FILE: &str = "announcement.wire.debug";
 /// Filename of last node announcement.
 #[cfg(not(debug_assertions))]
 pub const NODE_ANNOUNCEMENT_FILE: &str = "announcement.wire";
-
-/// Milliseconds since epoch.
-pub type Timestamp = u64;
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub enum PingState {
@@ -454,6 +453,10 @@ pub enum Command {
         addr: config::ConnectAddress,
         opts: ConnectOptions,
     },
+
+    /// Disconnect from a node.
+    #[serde(rename_all = "camelCase")]
+    Disconnect { nid: NodeId },
 
     /// Lookup seeds for the given repository in the routing table.
     #[serde(rename_all = "camelCase")]
@@ -862,6 +865,8 @@ pub trait Handle: Clone + Sync + Send {
         addr: Address,
         opts: ConnectOptions,
     ) -> Result<ConnectResult, Self::Error>;
+    /// Disconnect from a peer.
+    fn disconnect(&mut self, node: NodeId) -> Result<(), Self::Error>;
     /// Lookup the seeds of a given repository in the routing table.
     fn seeds(&mut self, id: RepoId) -> Result<Seeds, Self::Error>;
     /// Fetch a repository from the network.
@@ -1067,6 +1072,14 @@ impl Handle for Node {
             .ok_or(Error::EmptyResponse)??;
 
         Ok(result)
+    }
+
+    fn disconnect(&mut self, nid: NodeId) -> Result<(), Self::Error> {
+        self.call::<ConnectResult>(Command::Disconnect { nid }, DEFAULT_TIMEOUT)?
+            .next()
+            .ok_or(Error::EmptyResponse)??;
+
+        Ok(())
     }
 
     fn seeds(&mut self, rid: RepoId) -> Result<Seeds, Error> {

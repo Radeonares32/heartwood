@@ -86,7 +86,7 @@ pub const MAX_TIME_DELTA: LocalDuration = LocalDuration::from_mins(60);
 /// Maximum attempts to connect to a peer before we give up.
 pub const MAX_CONNECTION_ATTEMPTS: usize = 3;
 /// How far back from the present time should we request gossip messages when connecting to a peer,
-/// when we initially come online.
+/// when we come online for the first time.
 pub const INITIAL_SUBSCRIBE_BACKLOG_DELTA: LocalDuration = LocalDuration::from_mins(60 * 24);
 /// Minimum amount of time to wait before reconnecting to a peer.
 pub const MIN_RECONNECTION_DELTA: LocalDuration = LocalDuration::from_secs(3);
@@ -281,6 +281,16 @@ struct QueuedFetch {
     channel: Option<chan::Sender<FetchResult>>,
 }
 
+impl PartialEq for QueuedFetch {
+    fn eq(&self, other: &Self) -> bool {
+        self.rid == other.rid
+            && self.from == other.from
+            && self.refs_at == other.refs_at
+            && self.channel.is_none()
+            && other.channel.is_none()
+    }
+}
+
 /// Holds all node stores.
 #[derive(Debug)]
 pub struct Stores<D>(D);
@@ -383,8 +393,10 @@ pub struct Service<D, S, G> {
     last_sync: LocalTime,
     /// Last time the service routing table was pruned.
     last_prune: LocalTime,
-    /// Last time the service announced its inventory.
+    /// Last time the inventory was announced.
     last_announce: LocalTime,
+    /// Last timestamp used for announcements.
+    last_timestamp: Timestamp,
     /// Time when the service was initialized, or `None` if it wasn't initialized.
     started_at: Option<LocalTime>,
     /// Publishes events to subscribers.
@@ -445,6 +457,7 @@ where
             last_idle: LocalTime::default(),
             last_sync: LocalTime::default(),
             last_prune: LocalTime::default(),
+            last_timestamp: Timestamp::MIN,
             last_announce: LocalTime::default(),
             started_at: None,
             emitter,
@@ -555,6 +568,19 @@ where
         let nid = self.node_id();
         self.started_at = Some(time);
 
+        // Populate refs database. This is only useful as part of the upgrade process for nodes
+        // that have been online since before the refs database was created.
+        match self.db.refs().count() {
+            Ok(0) => {
+                info!(target: "service", "Empty refs database, populating from storage..");
+                if let Err(e) = self.db.refs_mut().populate(&self.storage) {
+                    error!(target: "service", "Failed to populate refs database: {e}");
+                }
+            }
+            Ok(n) => debug!(target: "service", "Refs database has {n} cached references"),
+            Err(e) => error!(target: "service", "Error checking refs database: {e}"),
+        }
+
         // Ensure that our local node is in our address database.
         self.db
             .addresses_mut()
@@ -575,7 +601,7 @@ where
         // all of it. It can happen that inventory is not properly seeded if for eg. the
         // user creates a new repository while the node is stopped.
         let rids = self.storage.inventory()?;
-        self.db.routing_mut().insert(&rids, nid, time.as_millis())?;
+        self.db.routing_mut().insert(&rids, nid, time.into())?;
 
         let announced = self
             .db
@@ -606,7 +632,7 @@ where
                 &rid,
                 &nid,
                 updated_at.oid,
-                updated_at.timestamp.as_millis(),
+                updated_at.timestamp.into(),
             )? {
                 debug!(target: "service", "Saved local sync status for {rid}..");
             }
@@ -696,7 +722,7 @@ where
             if let Err(err) = self
                 .db
                 .gossip_mut()
-                .prune((now - self.config.limits.gossip_max_age).as_millis())
+                .prune((now - self.config.limits.gossip_max_age).into())
             {
                 error!(target: "service", "Error pruning gossip entries: {err}");
             }
@@ -756,7 +782,7 @@ where
 
                 // Let all our peers know that we're interested in this repo from now on.
                 self.outbox.broadcast(
-                    Message::subscribe(self.filter(), self.time(), Timestamp::MAX),
+                    Message::subscribe(self.filter(), self.clock.into(), Timestamp::MAX),
                     self.sessions.connected().map(|(_, s)| s),
                 );
             }
@@ -830,17 +856,32 @@ where
         }
     }
 
-    /// Initiate an outgoing fetch for some repository, based on
-    /// another node's announcement.
+    /// Initiate an outgoing fetch for some repository, based on another node's announcement.
+    /// Returns `true` if the fetch was initiated and `false` if it was skipped.
     fn fetch_refs_at(
         &mut self,
         rid: RepoId,
         from: NodeId,
         refs: NonEmpty<RefsAt>,
+        scope: Scope,
         timeout: time::Duration,
         channel: Option<chan::Sender<FetchResult>>,
-    ) {
-        self._fetch(rid, from, refs.into(), timeout, channel)
+    ) -> bool {
+        match self.refs_status_of(rid, refs, &scope) {
+            Ok(status) => {
+                if status.want.is_empty() {
+                    debug!(target: "service", "Skipping fetch for {rid}, all refs are already in storage");
+                } else {
+                    self._fetch(rid, from, status.want, timeout, channel);
+                    return true;
+                }
+            }
+            Err(e) => {
+                error!(target: "service", "Error getting the refs status of {rid}: {e}");
+            }
+        }
+        // We didn't try to fetch anything.
+        false
     }
 
     /// Initiate an outgoing fetch for some repository.
@@ -879,13 +920,18 @@ where
                         fetching.subscribe(c);
                     }
                 } else {
-                    debug!(target: "service", "Queueing fetch for {rid} with {from}..");
-                    self.queue.push_back(QueuedFetch {
+                    let fetch = QueuedFetch {
                         rid,
                         refs_at,
                         from,
                         channel,
-                    });
+                    };
+                    if self.queue.contains(&fetch) {
+                        debug!(target: "service", "Fetch for {rid} with {from} is already queued..");
+                    } else {
+                        debug!(target: "service", "Queueing fetch for {rid} with {from}..");
+                        self.queue.push_back(fetch);
+                    }
                 }
             }
             Err(TryFetchError::SessionCapacityReached) => {
@@ -947,12 +993,7 @@ where
             refs_at: refs_at.clone(),
             subscribers: vec![],
         });
-        let namespaces = self.policies.namespaces_for(&self.storage, &rid)?;
-
-        self.outbox
-            .fetch(session, rid, namespaces, refs_at, timeout);
-
-        debug!(target: "service", "Fetch initiated for {rid} with {}..", session.id);
+        self.outbox.fetch(session, rid, refs_at, timeout);
 
         Ok(fetching)
     }
@@ -1004,12 +1045,15 @@ where
                 doc,
             }) => {
                 info!(target: "service", "Fetched {rid} from {remote} successfully");
+                // Update our routing table in case this fetch was user-initiated and doesn't
+                // come from an announcement.
+                self.seed_discovered(rid, remote, self.clock.into());
 
                 for update in &updated {
-                    if update.old() != update.new() {
-                        debug!(target: "service", "Ref updated: {update} for {rid}");
-                    } else {
+                    if update.is_skipped() {
                         trace!(target: "service", "Ref skipped: {update} for {rid}");
+                    } else {
+                        debug!(target: "service", "Ref updated: {update} for {rid}");
                     }
                 }
                 self.emitter.emit(Event::RefsFetched {
@@ -1028,7 +1072,7 @@ where
                 }
 
                 // It's possible for a fetch to succeed but nothing was updated.
-                if updated.is_empty() {
+                if updated.is_empty() || updated.iter().all(|u| u.is_skipped()) {
                     debug!(target: "service", "Nothing to announce, no refs were updated..");
                 } else {
                     // Finally, announce the refs. This is useful for nodes to know what we've synced,
@@ -1048,7 +1092,6 @@ where
                 }
             }
         }
-
         // We can now try to dequeue another fetch.
         self.dequeue_fetch();
     }
@@ -1066,30 +1109,20 @@ where
         {
             debug!(target: "service", "Dequeued fetch for {rid} from session {from}..");
 
-            // If no refs are specified, always do a full fetch.
-            if refs_at.is_empty() {
+            if let Some(refs) = NonEmpty::from_vec(refs_at) {
+                let repo_entry = self
+                    .policies
+                    .seed_policy(&rid)
+                    .expect("Service::dequeue_fetch: error accessing repo seeding configuration");
+
+                // Keep dequeueing if there was nothing to fetch, otherwise break.
+                if self.fetch_refs_at(rid, from, refs, repo_entry.scope, FETCH_TIMEOUT, channel) {
+                    break;
+                }
+            } else {
+                // If no refs are specified, always do a full fetch.
                 self.fetch(rid, from, FETCH_TIMEOUT, channel);
-                return;
-            }
-
-            let repo_entry = self
-                .policies
-                .seed_policy(&rid)
-                .expect("Service::dequeue_fetch: error accessing repo seeding configuration");
-
-            match self.refs_status_of(rid, refs_at, &repo_entry.scope) {
-                Ok(status) => {
-                    if let Some(refs) = NonEmpty::from_vec(status.fresh) {
-                        self.fetch_refs_at(rid, from, refs, FETCH_TIMEOUT, channel);
-                        return;
-                    } else {
-                        trace!(target: "service", "Skipping dequeued fetch for {rid}, all refs are already in local storage");
-                    }
-                }
-                Err(e) => {
-                    error!(target: "service", "Error getting the refs status of {rid}: {e}");
-                    return;
-                }
+                break;
             }
         }
     }
@@ -1139,14 +1172,17 @@ where
         self.emitter.emit(Event::PeerConnected { nid: remote });
 
         let msgs = self.initial(link);
-        let now = self.time();
 
         if link.is_outbound() {
             if let Some(peer) = self.sessions.get_mut(&remote) {
                 peer.to_connected(self.clock);
                 self.outbox.write_all(peer, msgs);
 
-                if let Err(e) = self.db.addresses_mut().connected(&remote, &peer.addr, now) {
+                if let Err(e) =
+                    self.db
+                        .addresses_mut()
+                        .connected(&remote, &peer.addr, self.clock.into())
+                {
                     error!(target: "service", "Error updating address book with connection: {e}");
                 }
             }
@@ -1278,7 +1314,6 @@ where
     /// and `false` if it should not.
     pub fn handle_announcement(
         &mut self,
-        relayer: &NodeId,
         relayer_addr: &Address,
         announcement: &Announcement,
     ) -> Result<bool, session::Error> {
@@ -1297,7 +1332,13 @@ where
         }
         let now = self.clock;
         let timestamp = message.timestamp();
-        let relay = self.config.relay;
+        // To avoid spamming peers on startup with historical gossip messages,
+        // don't relay messages that are too old.
+        let relay = if now - timestamp.to_local_time() > MAX_TIME_DELTA {
+            false
+        } else {
+            self.config.relay
+        };
 
         // Don't allow messages from too far in the future.
         if timestamp.saturating_sub(now.as_millis()) > MAX_TIME_DELTA.as_millis() as u64 {
@@ -1316,7 +1357,7 @@ where
             match self.db.addresses().get(announcer) {
                 Ok(node) => {
                     if node.is_none() {
-                        debug!(target: "service", "Ignoring announcement from unknown node {announcer}");
+                        debug!(target: "service", "Ignoring announcement from unknown node {announcer} (t={timestamp})");
                         return Ok(false);
                     }
                 }
@@ -1331,7 +1372,7 @@ where
         match self.db.gossip_mut().announced(announcer, announcement) {
             Ok(fresh) => {
                 if !fresh {
-                    debug!(target: "service", "Ignoring stale announcement from {announcer} (t={})", self.time());
+                    debug!(target: "service", "Ignoring stale announcement from {announcer} (t={timestamp})");
                     return Ok(false);
                 }
             }
@@ -1408,24 +1449,22 @@ where
                     refs: message.refs.to_vec(),
                     timestamp: message.timestamp,
                 });
+                // Empty announcements can be safely ignored.
+                let Some(refs) = NonEmpty::from_vec(message.refs.to_vec()) else {
+                    debug!(target: "service", "Skipping fetch, no refs in announcement for {} (t={timestamp})", message.rid);
+                    return Ok(false);
+                };
                 // We update inventories when receiving ref announcements, as these could come
                 // from a new repository being initialized.
-                if let Ok(result) =
-                    self.db
-                        .routing_mut()
-                        .insert([&message.rid], *announcer, message.timestamp)
-                {
-                    if let &[(_, InsertResult::SeedAdded)] = result.as_slice() {
-                        self.emitter.emit(Event::SeedDiscovered {
-                            rid: message.rid,
-                            nid: *relayer,
-                        });
-                        info!(target: "service", "Routing table updated for {} with seed {announcer}", message.rid);
-                    }
-                }
+                self.seed_discovered(message.rid, *announcer, message.timestamp);
 
                 // Update sync status of announcer for this repo.
-                if let Some(refs) = message.refs.iter().find(|r| &r.remote == self.nid()) {
+                if let Some(refs) = refs.iter().find(|r| &r.remote == self.nid()) {
+                    debug!(
+                        target: "service",
+                        "Refs announcement of {announcer} for {} contains our own remote at {} (t={})",
+                        message.rid, refs.at, message.timestamp
+                    );
                     match self.db.seeds_mut().synced(
                         &message.rid,
                         announcer,
@@ -1444,6 +1483,12 @@ where
                                     remote: *announcer,
                                     at: refs.at,
                                 });
+                            } else {
+                                debug!(
+                                    target: "service",
+                                    "Sync status of {announcer} was not updated for {}",
+                                    message.rid,
+                                );
                             }
                         }
                         Err(e) => {
@@ -1457,7 +1502,7 @@ where
                 if repo_entry.policy != Policy::Allow {
                     debug!(
                         target: "service",
-                        "Ignoring refs announcement from {announcer}: repository {} isn't seeded",
+                        "Ignoring refs announcement from {announcer}: repository {} isn't seeded (t={timestamp})",
                         message.rid
                     );
                     return Ok(false);
@@ -1473,20 +1518,15 @@ where
                     );
                     return Ok(relay);
                 };
-
-                // Finally, if there's anything to fetch, we fetch it from the remote.
-                if let Some(refs) = NonEmpty::from_vec(
-                    message
-                        .refs
-                        .iter()
-                        .filter(|r| r.remote != self.node_id()) // Don't fetch our own refs.
-                        .cloned()
-                        .collect(),
-                ) {
-                    self.fetch_refs_at(message.rid, remote.id, refs, FETCH_TIMEOUT, None);
-                } else {
-                    debug!(target: "service", "Skipping fetch, no remote refs in announcement for {}", message.rid);
-                }
+                // Finally, start the fetch.
+                self.fetch_refs_at(
+                    message.rid,
+                    remote.id,
+                    refs,
+                    repo_entry.scope,
+                    FETCH_TIMEOUT,
+                    None,
+                );
                 return Ok(relay);
             }
             AnnouncementMessage::Node(
@@ -1517,6 +1557,8 @@ where
                     timestamp,
                     addresses
                         .iter()
+                        // Ignore non-routable addresses unless received from a local network
+                        // peer. This allows the node to function in a local network.
                         .filter(|a| a.is_routable() || relayer_addr.is_local())
                         .map(|a| KnownAddress::new(a.clone(), address::Source::Peer)),
                 ) {
@@ -1590,7 +1632,7 @@ where
                 let announcer = ann.node;
 
                 // Returning true here means that the message should be relayed.
-                if self.handle_announcement(&relayer, &relayer_addr, &ann)? {
+                if self.handle_announcement(&relayer_addr, &ann)? {
                     // Choose peers we should relay this message to.
                     // 1. Don't relay to the peer who sent us this message.
                     // 2. Don't relay to the peer who signed this announcement.
@@ -1685,37 +1727,47 @@ where
     fn refs_status_of(
         &self,
         rid: RepoId,
-        refs: Vec<RefsAt>,
+        refs: NonEmpty<RefsAt>,
         scope: &policy::Scope,
     ) -> Result<RefsStatus, Error> {
         let mut refs = RefsStatus::new(rid, refs, self.db.refs())?;
-        // First, check the freshness.
-        if refs.fresh.is_empty() {
+        // Check that there's something we want.
+        if refs.want.is_empty() {
             return Ok(refs);
         }
-        // Second, check the scope.
-        match scope {
-            policy::Scope::All => Ok(refs),
-            policy::Scope::Followed => {
-                match self.policies.namespaces_for(&self.storage, &rid) {
-                    Ok(Namespaces::All) => Ok(refs),
-                    Ok(Namespaces::Followed(mut followed)) => {
-                        // Get the set of followed nodes except self.
-                        followed.remove(self.nid());
-                        refs.fresh.retain(|r| followed.contains(&r.remote));
-
-                        Ok(refs)
-                    }
-                    Err(e) => Err(e.into()),
+        // Check scope.
+        let mut refs = match scope {
+            policy::Scope::All => refs,
+            policy::Scope::Followed => match self.policies.namespaces_for(&self.storage, &rid) {
+                Ok(Namespaces::All) => refs,
+                Ok(Namespaces::Followed(followed)) => {
+                    refs.want.retain(|r| followed.contains(&r.remote));
+                    refs
                 }
+                Err(e) => return Err(e.into()),
+            },
+        };
+        // Remove our own remote, we don't want to fetch that.
+        refs.want.retain(|r| r.remote != self.node_id());
+
+        Ok(refs)
+    }
+
+    /// Add a seed to our routing table.
+    fn seed_discovered(&mut self, rid: RepoId, nid: NodeId, time: Timestamp) {
+        if let Ok(result) = self.db.routing_mut().insert([&rid], nid, time) {
+            if let &[(_, InsertResult::SeedAdded)] = result.as_slice() {
+                self.emitter.emit(Event::SeedDiscovered { rid, nid });
+                info!(target: "service", "Routing table updated for {} with seed {nid}", rid);
             }
         }
     }
 
     /// Set of initial messages to send to a peer.
-    fn initial(&self, _link: Link) -> Vec<Message> {
-        let filter = self.filter();
+    fn initial(&mut self, _link: Link) -> Vec<Message> {
+        let timestamp = self.timestamp();
         let now = self.clock();
+        let filter = self.filter();
         let inventory = match self.storage.inventory() {
             Ok(i) => i,
             Err(e) => {
@@ -1736,8 +1788,8 @@ where
         // If this is our first connection to the network, we just ask for a fixed backlog
         // of messages to get us started.
         let since = match self.db.gossip().last() {
-            Ok(Some(last)) => last - MAX_TIME_DELTA.as_millis() as Timestamp,
-            Ok(None) => (*now - INITIAL_SUBSCRIBE_BACKLOG_DELTA).as_millis() as Timestamp,
+            Ok(Some(last)) => Timestamp::from(last.to_local_time() - MAX_TIME_DELTA),
+            Ok(None) => (*now - INITIAL_SUBSCRIBE_BACKLOG_DELTA).into(),
             Err(e) => {
                 error!(target: "service", "Error getting the lastest gossip message from storage: {e}");
                 return vec![];
@@ -1748,7 +1800,7 @@ where
 
         vec![
             Message::node(self.node.clone(), &self.signer),
-            Message::inventory(gossip::inventory(now.as_millis(), inventory), &self.signer),
+            Message::inventory(gossip::inventory(timestamp, inventory), &self.signer),
             Message::subscribe(filter, since, Timestamp::MAX),
         ]
     }
@@ -1765,7 +1817,7 @@ where
     /// Update our routing table with our local node's inventory.
     fn sync_inventory(&mut self) -> Result<SyncedRouting, Error> {
         let inventory = self.storage.inventory()?;
-        let result = self.sync_routing(inventory, self.node_id(), self.time())?;
+        let result = self.sync_routing(inventory, self.node_id(), self.clock.into())?;
 
         Ok(result)
     }
@@ -1821,12 +1873,12 @@ where
 
     /// Return a refs announcement including the given remotes.
     fn refs_announcement_for(
-        &self,
+        &mut self,
         rid: RepoId,
         remotes: impl IntoIterator<Item = NodeId>,
     ) -> Result<(Announcement, Vec<RefsAt>), Error> {
         let repo = self.storage.repository(rid)?;
-        let timestamp = self.time();
+        let timestamp = self.timestamp();
         let mut refs = BoundedVec::<_, REF_REMOTE_LIMIT>::new();
 
         for remote_id in remotes.into_iter() {
@@ -1852,19 +1904,24 @@ where
 
     /// Announce our own refs for the given repo.
     fn announce_own_refs(&mut self, rid: RepoId, doc: Doc<Verified>) -> Result<Vec<RefsAt>, Error> {
-        let refs = self.announce_refs(rid, doc, [self.node_id()])?;
+        let (refs, timestamp) = self.announce_refs(rid, doc, [self.node_id()])?;
 
         // Update refs database with our signed refs branches.
         // This isn't strictly necessary for now, as we only use the database for fetches, and
         // we don't fetch our own refs that are announced, but it's for good measure.
         if let &[r] = refs.as_slice() {
-            let now = self.local_time();
-
-            if let Err(e) =
-                self.database_mut()
-                    .refs_mut()
-                    .set(&rid, &r.remote, &SIGREFS_BRANCH, r.at, now)
-            {
+            self.emitter.emit(Event::LocalRefsAnnounced {
+                rid,
+                refs: r,
+                timestamp,
+            });
+            if let Err(e) = self.database_mut().refs_mut().set(
+                &rid,
+                &r.remote,
+                &SIGREFS_BRANCH,
+                r.at,
+                timestamp.to_local_time(),
+            ) {
                 error!(
                     target: "service",
                     "Error updating refs database for `rad/sigrefs` of {} in {rid}: {e}",
@@ -1881,20 +1938,25 @@ where
         rid: RepoId,
         doc: Doc<Verified>,
         remotes: impl IntoIterator<Item = NodeId>,
-    ) -> Result<Vec<RefsAt>, Error> {
-        let peers = self.sessions.connected().map(|(_, p)| p);
+    ) -> Result<(Vec<RefsAt>, Timestamp), Error> {
         let (ann, refs) = self.refs_announcement_for(rid, remotes)?;
+        let timestamp = ann.timestamp();
+        let peers = self.sessions.connected().map(|(_, p)| p);
 
         // Update our sync status for our own refs. This is useful for determining if refs were
         // updated while the node was stopped.
         // TODO: Move to `announce_own_refs`.
         if let Some(refs) = refs.iter().find(|r| r.remote == ann.node) {
-            info!(target: "service", "Announcing local refs for {rid} to peers ({})..", refs.at);
+            info!(
+                target: "service",
+                "Announcing own refs for {rid} to peers ({}) (t={timestamp})..",
+                refs.at
+            );
 
             if let Err(e) = self
                 .db
                 .seeds_mut()
-                .synced(&rid, &ann.node, refs.at, ann.timestamp())
+                .synced(&rid, &ann.node, refs.at, timestamp)
             {
                 error!(target: "service", "Error updating sync status for local node: {e}");
             }
@@ -1908,7 +1970,7 @@ where
             }),
             self.db.gossip_mut(),
         );
-        Ok(refs)
+        Ok((refs, timestamp))
     }
 
     fn sync_and_announce_inventory(&mut self) {
@@ -1957,9 +2019,9 @@ where
             return false;
         }
         let persistent = self.config.is_persistent(&nid);
-        let time = self.time();
+        let timestamp: Timestamp = self.clock.into();
 
-        if let Err(e) = self.db.addresses_mut().attempted(&nid, &addr, time) {
+        if let Err(e) = self.db.addresses_mut().attempted(&nid, &addr, timestamp) {
             error!(target: "service", "Error updating address book with connection attempt: {e}");
         }
         self.sessions.insert(
@@ -2032,9 +2094,16 @@ where
         }
     }
 
-    /// Get the current time.
-    fn time(&self) -> Timestamp {
-        self.clock.as_millis()
+    /// Get a timestamp for using in announcements.
+    /// Never returns the same timestamp twice.
+    fn timestamp(&mut self) -> Timestamp {
+        let now = Timestamp::from(self.clock);
+        if *now > *self.last_timestamp {
+            self.last_timestamp = now;
+        } else {
+            self.last_timestamp = self.last_timestamp + 1;
+        }
+        self.last_timestamp
     }
 
     ////////////////////////////////////////////////////////////////////////////
@@ -2043,23 +2112,7 @@ where
 
     /// Announce our inventory to all connected peers.
     fn announce_inventory(&mut self, inventory: Inventory) -> Result<(), storage::Error> {
-        let time = if self.clock > self.last_announce {
-            self.clock.as_millis()
-        } else if self.last_announce - self.clock < LocalDuration::from_secs(1) {
-            // In rare cases where the inventory is updated very quickly, we want to make sure all
-            // announcements carry an increasing timestamp. We allow our timestamps to be up to
-            // one second in the future.
-            self.last_announce.as_millis() + 1
-        } else {
-            // Announcement is considered redundant, ignore. Nb. This should not happen unless
-            // you are trying to spam inventories.
-            log::warn!(
-                target: "service",
-                "Ignored outgoing inventory announcement with {} items",
-                inventory.len()
-            );
-            return Ok(());
-        };
+        let time = self.timestamp();
         let msg = AnnouncementMessage::from(gossip::inventory(time, inventory));
 
         self.outbox.announce(
@@ -2067,7 +2120,7 @@ where
             self.sessions.connected().map(|(_, p)| p),
             self.db.gossip_mut(),
         );
-        self.last_announce = LocalTime::from_millis(time as u128);
+        self.last_announce = time.to_local_time();
 
         Ok(())
     }
@@ -2080,7 +2133,7 @@ where
 
         let delta = count - self.config.limits.routing_max_size;
         self.db.routing_mut().prune(
-            (*now - self.config.limits.routing_max_age).as_millis(),
+            (*now - self.config.limits.routing_max_age).into(),
             Some(delta),
         )?;
         Ok(())
